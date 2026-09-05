@@ -355,10 +355,18 @@ static void lkdtm_SLAB_FREE_PAGE(void)
 	free_page(p);
 }
 
+static void lkdtm_noop_ctor(void *obj) {}
+
 void __init lkdtm_heap_init(void)
 {
+	/*
+	 * Use a constructor so that the freepointer is placed outside the
+	 * object body (freeptr_outside_object), which is required for
+	 * CONFIG_SLUB_DOUBLEFREE_CHECK to detect the double-free.
+	 */
 	double_free_cache = kmem_cache_create("lkdtm-heap-double_free",
-					      64, 0, SLAB_NO_MERGE, NULL);
+					      64, 0, SLAB_NO_MERGE,
+					      lkdtm_noop_ctor);
 	a_cache = kmem_cache_create("lkdtm-heap-a", 64, 0, SLAB_NO_MERGE, NULL);
 	b_cache = kmem_cache_create("lkdtm-heap-b", 64, 0, SLAB_NO_MERGE, NULL);
 }
