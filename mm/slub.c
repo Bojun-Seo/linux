@@ -585,6 +585,55 @@ static inline bool freeptr_outside_object(struct kmem_cache *s)
 	return s->offset >= s->inuse;
 }
 
+#ifdef CONFIG_SLUB_DOUBLEFREE_CHECK
+/*
+ * Sentinel value written into the freepointer slot when an object is freed.
+ * On the next free of the same object (before reallocation), this value will
+ * still be present, indicating a double-free.
+ *
+ * The value is stored encoded via freelist_ptr_encode(), so it is
+ * address-dependent and differs per object slot, making accidental
+ * collisions with user data extremely unlikely.
+ *
+ * Using the address 1 (never a valid kernel pointer) as the sentinel.
+ *
+ * Sentinel tracking is only applied when the freepointer is stored outside
+ * the object body (freeptr_outside_object). When the freepointer overlaps
+ * with user data, the user may overwrite the sentinel after allocation,
+ * causing false positives on the next free. In the outside case the
+ * freepointer slot lies in the per-object metadata area and is never
+ * touched by the allocator's caller, so the sentinel is guaranteed to
+ * survive until the next free operation.
+ */
+#define SLUB_FREE_SENTINEL	((void *)1UL)
+
+static inline void set_freeptr_sentinel(struct kmem_cache *s, void *object)
+{
+	unsigned long freeptr_addr;
+
+	if (!freeptr_outside_object(s))
+		return;
+
+	freeptr_addr = (unsigned long)kasan_reset_tag(object) + s->offset;
+	*(freeptr_t *)freeptr_addr = freelist_ptr_encode(s, SLUB_FREE_SENTINEL,
+							 freeptr_addr);
+}
+
+static inline bool is_freeptr_sentinel(struct kmem_cache *s, void *object)
+{
+	unsigned long freeptr_addr;
+	freeptr_t p;
+
+	if (!freeptr_outside_object(s))
+		return false;
+
+	freeptr_addr = (unsigned long)kasan_reset_tag(object) + s->offset;
+	p = *(freeptr_t *)freeptr_addr;
+
+	return freelist_ptr_decode(s, p, freeptr_addr) == SLUB_FREE_SENTINEL;
+}
+#endif /* CONFIG_SLUB_DOUBLEFREE_CHECK */
+
 /*
  * Return offset of the end of info block which is inuse + free pointer if
  * not overlapping with object.
@@ -2670,6 +2719,26 @@ bool slab_free_hook(struct kmem_cache *s, void *x, bool init,
 	/* Are the object contents still accessible? */
 	bool still_accessible = (s->flags & SLAB_TYPESAFE_BY_RCU) && !after_rcu_delay;
 
+#ifdef CONFIG_SLUB_DOUBLEFREE_CHECK
+	/*
+	 * Check for double-free by inspecting the freepointer slot before any
+	 * other modification. Skip objects that are still accessible via RCU,
+	 * as SLAB_TYPESAFE_BY_RCU objects may be freed and reallocated while
+	 * still referenced, making such a check unreliable.
+	 *
+	 * The sentinel is written by set_freeptr_sentinel() at the end of this
+	 * function and is overwritten by set_freepointer() during reallocation,
+	 * so its presence here means the object was freed without an intervening
+	 * allocation.
+	 */
+	if (!still_accessible && unlikely(is_freeptr_sentinel(s, x))) {
+		pr_err("SLUB: double-free detected in cache '%s', object 0x%p\n",
+		       s->name, x);
+		dump_stack();
+		return false;
+	}
+#endif
+
 	kmemleak_free_recursive(x, s->flags);
 	kmsan_slab_free(s, x);
 
@@ -2744,6 +2813,20 @@ bool slab_free_hook(struct kmem_cache *s, void *x, bool init,
 		set_orig_size(s, x, orig_size);
 
 	}
+#ifdef CONFIG_SLUB_DOUBLEFREE_CHECK
+	/*
+	 * Write the sentinel after any init-on-free zeroing, so it is not
+	 * wiped out. The sentinel is placed in the freepointer slot, which
+	 * is either inside or outside the object body. In the outside case,
+	 * zeroing does not reach it. In the inside case, zeroing ends at
+	 * s->inuse, which covers the freepointer slot; we write after that.
+	 *
+	 * Skip SLAB_TYPESAFE_BY_RCU objects: still_accessible ones deferred
+	 * via call_rcu() have their freepointer slot potentially in use.
+	 */
+	if (!still_accessible)
+		set_freeptr_sentinel(s, x);
+#endif
 	/* KASAN might put x into memory quarantine, delaying its reuse. */
 	return !kasan_slab_free(s, x, init, still_accessible, false);
 }
@@ -4691,6 +4774,23 @@ bool slab_post_alloc_hook(struct kmem_cache *s, gfp_t flags, size_t size,
 		 */
 		if (init && p[i] && !is_kfence_address(p[i]))
 			memset(p[i], 0, zero_size);
+
+#ifdef CONFIG_SLUB_DOUBLEFREE_CHECK
+		/*
+		 * When the freepointer lives outside the object body, the
+		 * sentinel written at free time survives in the metadata slot
+		 * through sheaf-based recycling (which does not call
+		 * set_freepointer).  Clear it here before handing the object
+		 * to the caller so that a legitimate subsequent free is not
+		 * mistaken for a double-free.
+		 *
+		 * set_freeptr_sentinel() already skips the inside-object case,
+		 * and we must do the same here to avoid corrupting user data
+		 * when the freepointer overlaps with the object body.
+		 */
+		if (p[i] && !is_kfence_address(p[i]) && freeptr_outside_object(s))
+			set_freepointer(s, p[i], NULL);
+#endif
 
 		if (alloc_flags_allow_spinning(ac->alloc_flags))
 			kmemleak_alloc_recursive(p[i], s->object_size, 1,

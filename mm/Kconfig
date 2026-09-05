@@ -214,6 +214,26 @@ config SLAB_FREELIST_HARDENED
 	  sacrifices to harden the kernel slab allocator against common
 	  freelist exploit methods.
 
+config SLUB_DOUBLEFREE_CHECK
+	bool "Lightweight double-free detection in SLUB"
+	depends on !SLUB_TINY
+	help
+	  Detect double-free errors in the SLUB allocator with minimal
+	  overhead. When an object is freed, a sentinel value is written
+	  into its freepointer slot. If the same object is freed again
+	  before being reallocated, the sentinel is detected and a warning
+	  with a stack trace is emitted.
+
+	  Unlike slub_debug or KASAN, this check imposes only a single
+	  read per free operation on the hot path, making it suitable for
+	  production kernels where double-free bugs are suspected.
+
+	  Note: this check is bypassed by objects managed with
+	  SLAB_TYPESAFE_BY_RCU, as such objects can be legitimately
+	  reused while still referenced by RCU readers.
+
+	  If unsure, say N.
+
 config SLAB_BUCKETS
 	bool "Support allocation from separate kmalloc buckets"
 	depends on !SLUB_TINY
