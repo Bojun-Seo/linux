@@ -585,6 +585,100 @@ static inline bool freeptr_outside_object(struct kmem_cache *s)
 	return s->offset >= s->inuse;
 }
 
+#ifdef CONFIG_SLUB_DOUBLEFREE_CHECK
+/*
+ * Sentinel written into the freepointer slot of a freed object, so that a
+ * second free of the same object can be recognized in O(1) on the next
+ * kmem_cache_free().
+ *
+ * It is stored through freelist_ptr_encode(), so with
+ * CONFIG_SLAB_FREELIST_HARDENED it is address dependent and per-cache random,
+ * exactly like a real freepointer.  The address 1 is never a valid object
+ * pointer, so a decoded sentinel cannot be mistaken for a freelist link.
+ */
+#define SLUB_FREE_SENTINEL	((void *)1UL)
+
+/*
+ * The sentinel is only usable for caches and objects where all of the
+ * following hold:
+ *
+ * - The cache uses percpu sheaves.  A sheaf keeps freed objects as plain
+ *   pointers in an array and never touches the freepointer slot, so the
+ *   sentinel survives until the object is handed out again.  Without sheaves
+ *   __slab_free() links the object into the slab freelist with
+ *   set_freepointer() right after slab_free_hook() returns, so the sentinel
+ *   would be gone long before a second free could observe it.  Worse, it
+ *   would still be in place while free_debug_processing() validates the
+ *   freepointer, and check_object() would report a bogus "Freepointer
+ *   corrupt".  cache_has_sheaves() is false for exactly the caches that run
+ *   those checks (SLAB_DEBUG_FLAGS) and for SLUB_TINY.
+ *
+ * - The freepointer is stored outside the object body.  Otherwise the slot
+ *   overlaps user data that the owner may write to while the object is
+ *   allocated, which would produce false positives.
+ *
+ * - The cache is not SLAB_TYPESAFE_BY_RCU.  Such objects may be legitimately
+ *   reused while readers still hold references, so a sentinel says nothing
+ *   about whether a free is a duplicate.
+ *
+ * - The object does not come from KFENCE.  A KFENCE object is placed next to
+ *   a guard page and its freepointer slot lies past the end of the object, so
+ *   the slot must not be dereferenced.  KFENCE detects double frees itself.
+ */
+static inline bool use_freeptr_sentinel(struct kmem_cache *s, void *object)
+{
+	return cache_has_sheaves(s) && freeptr_outside_object(s) &&
+	       !(s->flags & SLAB_TYPESAFE_BY_RCU) && !is_kfence_address(object);
+}
+
+static inline void set_freeptr_sentinel(struct kmem_cache *s, void *object)
+{
+	unsigned long freeptr_addr;
+
+	if (!use_freeptr_sentinel(s, object))
+		return;
+
+	freeptr_addr = (unsigned long)kasan_reset_tag(object) + s->offset;
+	*(freeptr_t *)freeptr_addr = freelist_ptr_encode(s, SLUB_FREE_SENTINEL,
+							 freeptr_addr);
+}
+
+static inline bool is_freeptr_sentinel(struct kmem_cache *s, void *object)
+{
+	unsigned long freeptr_addr;
+	freeptr_t p;
+
+	if (!use_freeptr_sentinel(s, object))
+		return false;
+
+	freeptr_addr = (unsigned long)kasan_reset_tag(object) + s->offset;
+	p = *(freeptr_t *)freeptr_addr;
+
+	return freelist_ptr_decode(s, p, freeptr_addr) == SLUB_FREE_SENTINEL;
+}
+
+/*
+ * Clear the sentinel before the object is handed to its new owner.  Sheaves
+ * do not call set_freepointer() when recycling an object, so without this the
+ * next legitimate free would look like a double free.
+ */
+static inline void clear_freeptr_sentinel(struct kmem_cache *s, void *object)
+{
+	if (!object || !use_freeptr_sentinel(s, object))
+		return;
+
+	set_freepointer(s, object, NULL);
+}
+#else
+static inline void set_freeptr_sentinel(struct kmem_cache *s, void *object) { }
+static inline bool is_freeptr_sentinel(struct kmem_cache *s, void *object)
+{
+	return false;
+}
+
+static inline void clear_freeptr_sentinel(struct kmem_cache *s, void *object) { }
+#endif /* CONFIG_SLUB_DOUBLEFREE_CHECK */
+
 /*
  * Return offset of the end of info block which is inuse + free pointer if
  * not overlapping with object.
@@ -2638,6 +2732,26 @@ struct rcu_delayed_free {
 };
 #endif
 
+#ifdef CONFIG_SLUB_DOUBLEFREE_CHECK
+static noinline void report_double_free(struct kmem_cache *s, void *object)
+{
+	static DEFINE_RATELIMIT_STATE(dfree_rs, DEFAULT_RATELIMIT_INTERVAL,
+				      DEFAULT_RATELIMIT_BURST);
+
+	if (slab_add_kunit_errors())
+		return;
+
+	if (!__ratelimit(&dfree_rs))
+		return;
+
+	pr_err("SLUB: double free of object %p in cache '%s'\n", object, s->name);
+	dump_stack_lvl(KERN_ERR);
+	add_taint(TAINT_BAD_PAGE, LOCKDEP_STILL_OK);
+}
+#else
+static inline void report_double_free(struct kmem_cache *s, void *object) { }
+#endif
+
 /*
  * Hooks for other subsystems that check memory allocations. In a typical
  * production configuration these hooks all should produce no code at all.
@@ -2670,6 +2784,15 @@ bool slab_free_hook(struct kmem_cache *s, void *x, bool init,
 {
 	/* Are the object contents still accessible? */
 	bool still_accessible = (s->flags & SLAB_TYPESAFE_BY_RCU) && !after_rcu_delay;
+
+	/*
+	 * Look for the double-free sentinel before anything else touches the
+	 * object, so the reported stack trace is the one of the second free.
+	 */
+	if (unlikely(is_freeptr_sentinel(s, x))) {
+		report_double_free(s, x);
+		return false;
+	}
 
 	kmemleak_free_recursive(x, s->flags);
 	kmsan_slab_free(s, x);
@@ -2745,6 +2868,14 @@ bool slab_free_hook(struct kmem_cache *s, void *x, bool init,
 		set_orig_size(s, x, orig_size);
 
 	}
+
+	/*
+	 * Arm the double-free sentinel.  The init-on-free memset above starts at
+	 * get_info_end(s), which is past the freepointer slot for every cache
+	 * the sentinel applies to, so the two never overlap.
+	 */
+	set_freeptr_sentinel(s, x);
+
 	/* KASAN might put x into memory quarantine, delaying its reuse. */
 	return !kasan_slab_free(s, x, init, still_accessible, false);
 }
@@ -4692,6 +4823,8 @@ bool slab_post_alloc_hook(struct kmem_cache *s, gfp_t flags, size_t size,
 		 */
 		if (init && p[i] && !is_kfence_address(p[i]))
 			memset(p[i], 0, zero_size);
+
+		clear_freeptr_sentinel(s, p[i]);
 
 		if (alloc_flags_allow_spinning(ac->alloc_flags))
 			kmemleak_alloc_recursive(p[i], s->object_size, 1,
