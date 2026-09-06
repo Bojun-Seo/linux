@@ -10,6 +10,7 @@
 #include <linux/sched.h>
 
 static struct kmem_cache *double_free_cache;
+static struct kmem_cache *double_free_ctor_cache;
 static struct kmem_cache *a_cache;
 static struct kmem_cache *b_cache;
 
@@ -330,6 +331,28 @@ static void lkdtm_SLAB_FREE_DOUBLE(void)
 	kmem_cache_free(double_free_cache, val);
 }
 
+/*
+ * Same as SLAB_FREE_DOUBLE, but on a cache with a constructor.  A constructor
+ * makes SLUB place the freepointer outside the object body, which is what
+ * CONFIG_SLUB_DOUBLEFREE_CHECK needs in order to notice the second free.
+ */
+static void lkdtm_SLAB_FREE_DOUBLE_CTOR(void)
+{
+	int *val;
+
+	val = kmem_cache_alloc(double_free_ctor_cache, GFP_KERNEL);
+	if (!val) {
+		pr_info("Unable to allocate double_free_ctor_cache memory.\n");
+		return;
+	}
+
+	/* Just make sure we got real memory. */
+	*val = 0x12345678;
+	pr_info("Attempting double slab free on a constructor cache ...\n");
+	kmem_cache_free(double_free_ctor_cache, val);
+	kmem_cache_free(double_free_ctor_cache, val);
+}
+
 static void lkdtm_SLAB_FREE_CROSS(void)
 {
 	int *val;
@@ -355,10 +378,17 @@ static void lkdtm_SLAB_FREE_PAGE(void)
 	free_page(p);
 }
 
+static void lkdtm_double_free_ctor(void *obj)
+{
+}
+
 void __init lkdtm_heap_init(void)
 {
 	double_free_cache = kmem_cache_create("lkdtm-heap-double_free",
 					      64, 0, SLAB_NO_MERGE, NULL);
+	double_free_ctor_cache = kmem_cache_create("lkdtm-heap-double_free_ctor",
+						   64, 0, SLAB_NO_MERGE,
+						   lkdtm_double_free_ctor);
 	a_cache = kmem_cache_create("lkdtm-heap-a", 64, 0, SLAB_NO_MERGE, NULL);
 	b_cache = kmem_cache_create("lkdtm-heap-b", 64, 0, SLAB_NO_MERGE, NULL);
 }
@@ -366,6 +396,7 @@ void __init lkdtm_heap_init(void)
 void __exit lkdtm_heap_exit(void)
 {
 	kmem_cache_destroy(double_free_cache);
+	kmem_cache_destroy(double_free_ctor_cache);
 	kmem_cache_destroy(a_cache);
 	kmem_cache_destroy(b_cache);
 }
@@ -381,6 +412,7 @@ static struct crashtype crashtypes[] = {
 	CRASHTYPE(SLAB_INIT_ON_ALLOC),
 	CRASHTYPE(BUDDY_INIT_ON_ALLOC),
 	CRASHTYPE(SLAB_FREE_DOUBLE),
+	CRASHTYPE(SLAB_FREE_DOUBLE_CTOR),
 	CRASHTYPE(SLAB_FREE_CROSS),
 	CRASHTYPE(SLAB_FREE_PAGE),
 };
