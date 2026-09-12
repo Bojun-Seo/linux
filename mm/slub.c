@@ -320,6 +320,12 @@ void *fixup_red_left(struct kmem_cache *s, void *p)
 #else
 #define __CMPXCHG_DOUBLE	__SLAB_FLAG_UNUSED
 #endif
+/* Cache qualifies for the CONFIG_SLUB_DOUBLEFREE_CHECK sentinel */
+#ifdef CONFIG_SLUB_DOUBLEFREE_CHECK
+#define __FREEPTR_SENTINEL	__SLAB_FLAG_BIT(_SLAB_FREEPTR_SENTINEL)
+#else
+#define __FREEPTR_SENTINEL	__SLAB_FLAG_UNUSED
+#endif
 
 /*
  * Tracking user of a slab.
@@ -584,6 +590,134 @@ static inline bool freeptr_outside_object(struct kmem_cache *s)
 {
 	return s->offset >= s->inuse;
 }
+
+#ifdef CONFIG_SLUB_DOUBLEFREE_CHECK
+/*
+ * Sentinel written into the freepointer slot of a freed object, so that a
+ * second free of the same object can be recognized in O(1) on the next
+ * kmem_cache_free().
+ *
+ * This is a best-effort check for a subsequent free, not synchronization
+ * between concurrent frees.  The check and store are not an atomic operation.
+ * Reallocation or draining the object to a slab freelist ends the detection
+ * window, even if the object is later refilled into a sheaf.
+ *
+ * It is stored through freelist_ptr_encode(), so with
+ * CONFIG_SLAB_FREELIST_HARDENED it is address dependent and per-cache random,
+ * exactly like a real freepointer.  The address 1 is never a valid object
+ * pointer, so a decoded sentinel cannot be mistaken for a freelist link.
+ */
+#define SLUB_FREE_SENTINEL	((void *)1UL)
+
+/*
+ * The sentinel is only usable for caches where all of the following hold:
+ *
+ * - The cache uses percpu sheaves.  A sheaf keeps freed objects as plain
+ *   pointers in an array and never touches the freepointer slot, so the
+ *   sentinel survives until reuse or a flush to the slab freelist, also
+ *   while the sheaf is held in a barn or by a prefill caller.  Without
+ *   sheaves __slab_free() links the object into the slab freelist with
+ *   set_freepointer() right after slab_free_hook() returns, so the sentinel
+ *   would be gone long before a second free could observe it.  Worse, it
+ *   would still be in place while free_debug_processing() validates the
+ *   freepointer, and check_object() would report a bogus "Freepointer
+ *   corrupt".  cache_has_sheaves() is false for every cache that runs those
+ *   checks (SLAB_DEBUG_FLAGS), and for SLUB_TINY.
+ *
+ * - The freepointer is stored outside the object body.  Otherwise the slot
+ *   overlaps user data that the owner may write to while the object is
+ *   allocated, which would produce false positives.
+ *
+ * - The cache is not SLAB_TYPESAFE_BY_RCU.  Such objects may be legitimately
+ *   reused while readers still hold references, so a sentinel says nothing
+ *   about whether a free is a duplicate.
+ *
+ * None of this can change over the lifetime of a cache, so it is evaluated
+ * once at creation time and recorded in s->flags.  The hot paths then only
+ * test one bit of a word they already have to load.
+ */
+static bool cache_uses_freeptr_sentinel(struct kmem_cache *s)
+{
+	return cache_has_sheaves(s) && freeptr_outside_object(s) &&
+	       !(s->flags & SLAB_TYPESAFE_BY_RCU);
+}
+
+static void set_cache_freeptr_sentinel(struct kmem_cache *s)
+{
+	if (cache_uses_freeptr_sentinel(s))
+		s->flags |= __FREEPTR_SENTINEL;
+	else
+		s->flags &= ~__FREEPTR_SENTINEL;
+}
+
+/*
+ * On top of the cache being eligible, the object must not come from KFENCE.
+ * A KFENCE object is placed next to a guard page and its freepointer slot lies
+ * past the end of the object, so the slot must not be dereferenced.  KFENCE
+ * detects double frees itself.
+ */
+static inline bool use_freeptr_sentinel(struct kmem_cache *s, void *object)
+{
+	return (s->flags & __FREEPTR_SENTINEL) && !is_kfence_address(object);
+}
+
+static noinline void __set_freeptr_sentinel(struct kmem_cache *s, void *object)
+{
+	unsigned long freeptr_addr;
+
+	freeptr_addr = (unsigned long)kasan_reset_tag(object) + s->offset;
+	*(freeptr_t *)freeptr_addr = freelist_ptr_encode(s, SLUB_FREE_SENTINEL,
+							 freeptr_addr);
+}
+
+static inline void set_freeptr_sentinel(struct kmem_cache *s, void *object)
+{
+	if (unlikely(use_freeptr_sentinel(s, object)))
+		__set_freeptr_sentinel(s, object);
+}
+
+static noinline bool __is_freeptr_sentinel(struct kmem_cache *s, void *object)
+{
+	unsigned long freeptr_addr;
+	freeptr_t p;
+
+	freeptr_addr = (unsigned long)kasan_reset_tag(object) + s->offset;
+	p = *(freeptr_t *)freeptr_addr;
+
+	return freelist_ptr_decode(s, p, freeptr_addr) == SLUB_FREE_SENTINEL;
+}
+
+static inline bool is_freeptr_sentinel(struct kmem_cache *s, void *object)
+{
+	return unlikely(use_freeptr_sentinel(s, object)) &&
+	       __is_freeptr_sentinel(s, object);
+}
+
+/*
+ * Clear the sentinel before the object is handed to its new owner.  Sheaves
+ * do not call set_freepointer() when recycling an object, so without this the
+ * next legitimate free would look like a double free.
+ */
+static noinline void __clear_freeptr_sentinel(struct kmem_cache *s, void *object)
+{
+	set_freepointer(s, object, NULL);
+}
+
+static inline void clear_freeptr_sentinel(struct kmem_cache *s, void *object)
+{
+	if (unlikely(object && use_freeptr_sentinel(s, object)))
+		__clear_freeptr_sentinel(s, object);
+}
+#else
+static inline void set_cache_freeptr_sentinel(struct kmem_cache *s) { }
+static inline void set_freeptr_sentinel(struct kmem_cache *s, void *object) { }
+static inline bool is_freeptr_sentinel(struct kmem_cache *s, void *object)
+{
+	return false;
+}
+
+static inline void clear_freeptr_sentinel(struct kmem_cache *s, void *object) { }
+#endif /* CONFIG_SLUB_DOUBLEFREE_CHECK */
 
 /*
  * Return offset of the end of info block which is inuse + free pointer if
@@ -2068,6 +2202,7 @@ static inline void inc_slabs_node(struct kmem_cache *s, int node,
 							int objects) {}
 static inline void dec_slabs_node(struct kmem_cache *s, int node,
 							int objects) {}
+static inline bool slab_add_kunit_errors(void) { return false; }
 #endif /* CONFIG_SLUB_DEBUG */
 
 /*
@@ -2637,6 +2772,37 @@ struct rcu_delayed_free {
 };
 #endif
 
+#ifdef CONFIG_SLUB_DOUBLEFREE_CHECK
+/*
+ * Report a free of an object that still carries the sentinel and return true,
+ * telling the caller to drop the free.  CHECK_DATA_CORRUPTION() BUG()s with
+ * CONFIG_BUG_ON_DATA_CORRUPTION and WARN()s otherwise, so panic_on_warn also
+ * makes a double free fatal.  Only the WARN() is rate limited.
+ */
+static noinline bool report_double_free(struct kmem_cache *s, void *object)
+{
+	static DEFINE_RATELIMIT_STATE(dfree_rs, DEFAULT_RATELIMIT_INTERVAL,
+				      DEFAULT_RATELIMIT_BURST);
+
+	if (slab_add_kunit_errors())
+		return true;
+
+	add_taint(TAINT_BAD_PAGE, LOCKDEP_STILL_OK);
+
+	if (!IS_ENABLED(CONFIG_BUG_ON_DATA_CORRUPTION) && !__ratelimit(&dfree_rs))
+		return true;
+
+	return CHECK_DATA_CORRUPTION(true, NULL,
+				     "SLUB: double free of object %p in cache '%s'\n",
+				     object, s->name);
+}
+#else
+static inline bool report_double_free(struct kmem_cache *s, void *object)
+{
+	return false;
+}
+#endif
+
 /*
  * Hooks for other subsystems that check memory allocations. In a typical
  * production configuration these hooks all should produce no code at all.
@@ -2744,8 +2910,41 @@ bool slab_free_hook(struct kmem_cache *s, void *x, bool init,
 		set_orig_size(s, x, orig_size);
 
 	}
+
+	/*
+	 * Arm the double-free sentinel.  The init-on-free memset above starts at
+	 * get_info_end(s), which is past the freepointer slot for every cache
+	 * the sentinel applies to, so the two never overlap.
+	 */
+	set_freeptr_sentinel(s, x);
+
 	/* KASAN might put x into memory quarantine, delaying its reuse. */
 	return !kasan_slab_free(s, x, init, still_accessible, false);
+}
+
+/*
+ * Process a free before the object is linked into a freelist.  Reject a
+ * duplicate before running accounting hooks: allocation profiling can warn
+ * about an already cleared tag even though it will not uncharge it twice.
+ * Keep the existing accounting-before-slab_free_hook() order for accepted
+ * frees, including objects whose reuse is delayed by that hook.
+ *
+ * The detached-freelist bulk path cannot use this check because building the
+ * list has already overwritten the sentinel.  Allocation aborts and resumed
+ * RCU-debug frees also keep their separate, partial hook sequences.
+ */
+static __fastpath_inline
+bool slab_free_single_hook(struct kmem_cache *s, struct slab *slab,
+			   void *object, bool init, bool after_rcu_delay)
+{
+	if (unlikely(is_freeptr_sentinel(s, object)) &&
+	    report_double_free(s, object))
+		return false;
+
+	memcg_slab_free_hook(s, slab, &object, 1);
+	alloc_tagging_slab_free_hook(s, slab, &object, 1);
+
+	return slab_free_hook(s, object, init, after_rcu_delay);
 }
 
 static __fastpath_inline
@@ -3003,10 +3202,7 @@ static bool __rcu_free_sheaf_prepare(struct kmem_cache *s,
 	while (i < sheaf->size) {
 		struct slab *slab = virt_to_slab(p[i]);
 
-		memcg_slab_free_hook(s, slab, p + i, 1);
-		alloc_tagging_slab_free_hook(s, slab, p + i, 1);
-
-		if (unlikely(!slab_free_hook(s, p[i], init, true))) {
+		if (unlikely(!slab_free_single_hook(s, slab, p[i], init, true))) {
 			p[i] = p[--sheaf->size];
 			continue;
 		}
@@ -4692,6 +4888,8 @@ bool slab_post_alloc_hook(struct kmem_cache *s, gfp_t flags, size_t size,
 		if (init && p[i] && !is_kfence_address(p[i]))
 			memset(p[i], 0, zero_size);
 
+		clear_freeptr_sentinel(s, p[i]);
+
 		if (alloc_flags_allow_spinning(ac->alloc_flags))
 			kmemleak_alloc_recursive(p[i], s->object_size, 1,
 						 s->flags, init_flags);
@@ -6369,10 +6567,7 @@ static void free_to_pcs_bulk(struct kmem_cache *s, size_t size, void **p)
 	for (unsigned int i = 0; i < size;) {
 		struct slab *slab = virt_to_slab(p[i]);
 
-		memcg_slab_free_hook(s, slab, p + i, 1);
-		alloc_tagging_slab_free_hook(s, slab, p + i, 1);
-
-		if (unlikely(!slab_free_hook(s, p[i], init, false))) {
+		if (unlikely(!slab_free_single_hook(s, slab, p[i], init, false))) {
 			p[i] = p[--size];
 			continue;
 		}
@@ -6502,10 +6697,8 @@ static __fastpath_inline
 void slab_free(struct kmem_cache *s, struct slab *slab, void *object,
 	       unsigned long addr)
 {
-	memcg_slab_free_hook(s, slab, &object, 1);
-	alloc_tagging_slab_free_hook(s, slab, &object, 1);
-
-	if (unlikely(!slab_free_hook(s, object, slab_want_init_on_free(s), false)))
+	if (unlikely(!slab_free_single_hook(s, slab, object,
+					    slab_want_init_on_free(s), false)))
 		return;
 
 	if (likely(can_free_to_pcs(slab)) && likely(free_to_pcs(s, object, true)))
@@ -8066,6 +8259,8 @@ static int calculate_sizes(struct kmem_cache_args *args, struct kmem_cache *s)
 	if (!is_kmalloc_cache(s))
 		s->sheaf_capacity = calculate_sheaf_capacity(s, args);
 
+	set_cache_freeptr_sentinel(s);
+
 	/*
 	 * Determine the number of objects per slab
 	 */
@@ -8623,6 +8818,9 @@ out:
 		panic("Out of memory when creating kmem_cache %s\n", s->name);
 
 	s->sheaf_capacity = capacity;
+
+	/* The cache only becomes eligible now that it has sheaves. */
+	set_cache_freeptr_sentinel(s);
 }
 
 static void __init bootstrap_kmalloc_sheaves(void)

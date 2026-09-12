@@ -214,6 +214,26 @@ config SLAB_FREELIST_HARDENED
 	  sacrifices to harden the kernel slab allocator against common
 	  freelist exploit methods.
 
+config SLUB_DOUBLEFREE_CHECK
+	bool "Lightweight double-free detection in SLUB"
+	depends on !SLUB_TINY
+	depends on !KASAN
+	help
+	  Detect double frees on slab caches created with a constructor,
+	  such as the inode caches, with a check meant to be cheap enough
+	  for production kernels.  The second free is reported as a kernel
+	  warning, taints the kernel and is dropped instead of corrupting the
+	  cache.  With panic_on_warn=1 or BUG_ON_DATA_CORRUPTION=y it is
+	  fatal instead.
+
+	  This is best effort: only a double free that happens while the
+	  object is still cached in a sheaf is caught, and racing frees can
+	  be missed.  kmalloc() caches, SLAB_TYPESAFE_BY_RCU caches and caches
+	  with slub_debug checks enabled are not covered; use KASAN or
+	  slub_debug=F for full coverage.  No object grows in size.
+
+	  If unsure, say N.
+
 config SLAB_BUCKETS
 	bool "Support allocation from separate kmalloc buckets"
 	depends on !SLUB_TINY

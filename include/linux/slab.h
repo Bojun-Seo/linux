@@ -66,6 +66,9 @@ enum _slab_flag_bits {
 #endif
 #endif
 	_SLAB_NO_SHEAVES,
+#ifdef CONFIG_SLUB_DOUBLEFREE_CHECK
+	_SLAB_FREEPTR_SENTINEL,
+#endif
 	_SLAB_FLAGS_LAST_BIT
 };
 
