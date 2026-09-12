@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0
+#include <kunit/resource.h>
 #include <kunit/test.h>
 #include <kunit/test-bug.h>
 #include <linux/mm.h>
@@ -6,9 +7,11 @@
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/rcupdate.h>
+#include <linux/sched.h>
 #include <linux/delay.h>
 #include <linux/perf_event.h>
 #include <linux/kprobes.h>
+#include <linux/topology.h>
 #include "../mm/slab.h"
 
 static struct kunit_resource resource;
@@ -255,6 +258,188 @@ static void test_leak_destroy(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, 2, slab_errors);
 }
 
+/* Only needed to make SLUB place the freepointer outside the object body. */
+static void double_free_ctor(void *obj)
+{
+}
+
+static void destroy_double_free_cache(void *cache)
+{
+	kmem_cache_destroy(cache);
+}
+
+/*
+ * CONFIG_SLUB_DOUBLEFREE_CHECK only arms its sentinel for caches that use
+ * percpu sheaves and keep the freepointer outside the object body, so the
+ * cache needs a constructor and must not pick up debug flags from a
+ * slub_debug= boot parameter.  SLAB_SKIP_KFENCE is set for the same reason as
+ * in test_kmem_cache_create(): a KFENCE object is excluded from the check,
+ * which would make the tests flaky.
+ */
+static struct kmem_cache *
+test_kmem_cache_create_ctor(struct kunit *test, const char *name,
+			    slab_flags_t flags)
+{
+	struct kmem_cache *s = kmem_cache_create(name, 64, 0,
+			flags | SLAB_NO_MERGE | SLAB_NO_USER_FLAGS, double_free_ctor);
+
+	if (!s)
+		return NULL;
+
+	s->flags |= SLAB_SKIP_KFENCE;
+	if (kunit_add_action_or_reset(test, destroy_double_free_cache, s))
+		return NULL;
+
+	return s;
+}
+
+/* Caller must keep migration disabled until it has finished using the object. */
+static void *alloc_double_free_object(struct kmem_cache *s)
+{
+	return kmem_cache_alloc_node(s, GFP_KERNEL | __GFP_THISNODE |
+				    __GFP_NOMEMALLOC | __GFP_NOWARN, numa_mem_id());
+}
+
+static void test_double_free(struct kunit *test)
+{
+	int after_first = -1, after_second = -1;
+	struct kmem_cache *s;
+	void *p;
+
+	if (!IS_ENABLED(CONFIG_SLUB_DOUBLEFREE_CHECK))
+		kunit_skip(test, "CONFIG_SLUB_DOUBLEFREE_CHECK is disabled");
+
+	s = test_kmem_cache_create_ctor(test, "TestSlub_double_free", 0);
+	KUNIT_ASSERT_NOT_NULL(test, s);
+	KUNIT_ASSERT_TRUE(test, cache_has_sheaves(s));
+
+	/*
+	 * can_free_to_pcs() rejects remote and pfmemalloc slabs.  Pinning the
+	 * task alone is not enough: forbid both allocation fallbacks as well.
+	 * This private cache has space for the object just allocated from it.
+	 * Do not use KUnit assertions while migration is disabled, since an
+	 * assertion abort would bypass migrate_enable().
+	 */
+	migrate_disable();
+	p = alloc_double_free_object(s);
+	if (p) {
+		kmem_cache_free(s, p);
+		after_first = slab_errors;
+
+		kmem_cache_free(s, p);
+		after_second = slab_errors;
+	}
+	migrate_enable();
+
+	if (!p)
+		kunit_skip(test, "could not allocate a local non-pfmemalloc object");
+
+	KUNIT_EXPECT_EQ(test, 0, after_first);
+	KUNIT_EXPECT_EQ(test, 1, after_second);
+
+	/*
+	 * The object had already been freed once, so dropping the second free
+	 * leaves the cache exactly as a single free would have: destroying it
+	 * must not find anything remaining.
+	 */
+	kunit_release_action(test, destroy_double_free_cache, s);
+	KUNIT_EXPECT_EQ(test, 1, slab_errors);
+}
+
+/*
+ * The sentinel has to be cleared again when the object is handed out, or the
+ * next legitimate free of a recycled object is mistaken for a double free and
+ * dropped, which loses the object.  Check the pointer as well as the error
+ * count, so allocating unrelated objects cannot make this test pass.
+ */
+static void test_double_free_reuse(struct kunit *test)
+{
+	struct kmem_cache *s;
+	void *first, *reused = NULL;
+
+	if (!IS_ENABLED(CONFIG_SLUB_DOUBLEFREE_CHECK))
+		kunit_skip(test, "CONFIG_SLUB_DOUBLEFREE_CHECK is disabled");
+
+	s = test_kmem_cache_create_ctor(test, "TestSlub_double_free_reuse", 0);
+	KUNIT_ASSERT_NOT_NULL(test, s);
+	KUNIT_ASSERT_TRUE(test, cache_has_sheaves(s));
+
+	migrate_disable();
+	first = alloc_double_free_object(s);
+	if (first) {
+		kmem_cache_free(s, first);
+		reused = alloc_double_free_object(s);
+		if (reused)
+			kmem_cache_free(s, reused);
+	}
+	migrate_enable();
+
+	if (!first)
+		kunit_skip(test, "could not allocate a local non-pfmemalloc object");
+
+	KUNIT_EXPECT_PTR_EQ(test, first, reused);
+	KUNIT_EXPECT_EQ(test, 0, slab_errors);
+
+	/* None of the frees was dropped, so nothing is left behind either. */
+	kunit_release_action(test, destroy_double_free_cache, s);
+	KUNIT_EXPECT_EQ(test, 0, slab_errors);
+}
+
+/* A pointer repeated within one bulk free is reported and dropped. */
+static void test_double_free_bulk(struct kunit *test)
+{
+	struct kmem_cache *s;
+	void *p[2];
+
+	if (!IS_ENABLED(CONFIG_SLUB_DOUBLEFREE_CHECK))
+		kunit_skip(test, "CONFIG_SLUB_DOUBLEFREE_CHECK is disabled");
+
+	s = test_kmem_cache_create_ctor(test, "TestSlub_double_free_bulk", 0);
+	KUNIT_ASSERT_NOT_NULL(test, s);
+	KUNIT_ASSERT_TRUE(test, cache_has_sheaves(s));
+
+	p[0] = kmem_cache_alloc(s, GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, p[0]);
+	p[1] = p[0];
+
+	/* Both hooks run before either pointer can reach the slab freelist. */
+	kmem_cache_free_bulk(s, ARRAY_SIZE(p), p);
+	KUNIT_EXPECT_EQ(test, 1, slab_errors);
+
+	kunit_release_action(test, destroy_double_free_cache, s);
+	KUNIT_EXPECT_EQ(test, 1, slab_errors);
+}
+
+/*
+ * A cache created with debug flags has no percpu sheaves, so the sentinel of
+ * CONFIG_SLUB_DOUBLEFREE_CHECK must not be armed for it.  If it were, it would
+ * still be sitting in the freepointer slot when free_debug_processing()
+ * validates it, and every single free would be reported as "Freepointer
+ * corrupt".
+ */
+static void test_double_free_debug_cache(struct kunit *test)
+{
+	struct kmem_cache *s;
+	void *p;
+
+	if (!IS_ENABLED(CONFIG_SLUB_DOUBLEFREE_CHECK))
+		kunit_skip(test, "CONFIG_SLUB_DOUBLEFREE_CHECK is disabled");
+
+	s = test_kmem_cache_create_ctor(test, "TestSlub_double_free_debug",
+					SLAB_POISON | SLAB_CONSISTENCY_CHECKS);
+	KUNIT_ASSERT_NOT_NULL(test, s);
+	KUNIT_ASSERT_FALSE(test, cache_has_sheaves(s));
+
+	p = kmem_cache_alloc(s, GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, p);
+
+	kmem_cache_free(s, p);
+	KUNIT_EXPECT_EQ(test, 0, slab_errors);
+
+	kunit_release_action(test, destroy_double_free_cache, s);
+	KUNIT_EXPECT_EQ(test, 0, slab_errors);
+}
+
 static void test_krealloc_redzone_zeroing(struct kunit *test)
 {
 	u8 *p;
@@ -488,6 +673,10 @@ static struct kunit_case test_cases[] = {
 	KUNIT_CASE(test_kfree_rcu),
 	KUNIT_CASE(test_kfree_rcu_wq_destroy),
 	KUNIT_CASE(test_leak_destroy),
+	KUNIT_CASE(test_double_free),
+	KUNIT_CASE(test_double_free_reuse),
+	KUNIT_CASE(test_double_free_bulk),
+	KUNIT_CASE(test_double_free_debug_cache),
 	KUNIT_CASE(test_krealloc_redzone_zeroing),
 #ifdef CONFIG_PERF_EVENTS
 	KUNIT_CASE_SLOW(test_kmalloc_nolock_and_friends_perf),
