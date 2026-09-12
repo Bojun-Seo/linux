@@ -8,8 +8,10 @@
 #include <linux/slab.h>
 #include <linux/vmalloc.h>
 #include <linux/sched.h>
+#include <linux/topology.h>
 
 static struct kmem_cache *double_free_cache;
+static struct kmem_cache *double_free_ctor_cache;
 static struct kmem_cache *a_cache;
 static struct kmem_cache *b_cache;
 
@@ -330,6 +332,62 @@ static void lkdtm_SLAB_FREE_DOUBLE(void)
 	kmem_cache_free(double_free_cache, val);
 }
 
+/*
+ * Same as SLAB_FREE_DOUBLE, but on a cache with a constructor.  A constructor
+ * makes SLUB place the freepointer outside the object body, which is what
+ * CONFIG_SLUB_DOUBLEFREE_CHECK needs in order to notice the second free.
+ */
+static void lkdtm_SLAB_FREE_DOUBLE_CTOR(void)
+{
+	const gfp_t gfp = GFP_KERNEL | __GFP_THISNODE | __GFP_NOMEMALLOC |
+			  __GFP_NOWARN;
+	int *val;
+	int i;
+
+	/*
+	 * Without the check the second free really does put the object into a
+	 * percpu sheaf twice and corrupts the cache.  SLAB_FREE_DOUBLE already
+	 * covers an unprotected double free, so there is nothing to add here.
+	 */
+	if (!IS_ENABLED(CONFIG_SLUB_DOUBLEFREE_CHECK)) {
+		pr_err("XFAIL: SLUB double-free check is not enabled (CONFIG_SLUB_DOUBLEFREE_CHECK=n)\n");
+		return;
+	}
+
+	if (!double_free_ctor_cache) {
+		pr_err("XFAIL: Unable to create the constructor cache\n");
+		return;
+	}
+
+	/*
+	 * The first free must stay in a sheaf.  Pin the task and disallow both
+	 * remote-node and pfmemalloc fallback; pinning alone would still allow
+	 * GFP_KERNEL to allocate from another node.  KFENCE has its own check,
+	 * so retry those allocations instead of testing a different detector.
+	 */
+	migrate_disable();
+	for (i = 0; i < 8; i++) {
+		val = kmem_cache_alloc_node(double_free_ctor_cache, gfp,
+					    numa_mem_id());
+		if (!val || !is_kfence_address(val))
+			break;
+		kmem_cache_free(double_free_ctor_cache, val);
+		val = NULL;
+	}
+	if (!val) {
+		migrate_enable();
+		pr_err("XFAIL: Unable to allocate a local non-KFENCE, non-pfmemalloc object\n");
+		return;
+	}
+
+	/* Just make sure we got real memory. */
+	*val = 0x12345678;
+	pr_info("Attempting double slab free on a constructor cache ...\n");
+	kmem_cache_free(double_free_ctor_cache, val);
+	kmem_cache_free(double_free_ctor_cache, val);
+	migrate_enable();
+}
+
 static void lkdtm_SLAB_FREE_CROSS(void)
 {
 	int *val;
@@ -355,10 +413,19 @@ static void lkdtm_SLAB_FREE_PAGE(void)
 	free_page(p);
 }
 
+/* Only needed to make SLUB place the freepointer outside the object body. */
+static void lkdtm_double_free_ctor(void *obj)
+{
+}
+
 void __init lkdtm_heap_init(void)
 {
 	double_free_cache = kmem_cache_create("lkdtm-heap-double_free",
 					      64, 0, SLAB_NO_MERGE, NULL);
+	/* Exercise the sentinel even when boot-time slab debugging is enabled. */
+	double_free_ctor_cache = kmem_cache_create("lkdtm-heap-double_free_ctor",
+						   64, 0, SLAB_NO_MERGE | SLAB_NO_USER_FLAGS,
+						   lkdtm_double_free_ctor);
 	a_cache = kmem_cache_create("lkdtm-heap-a", 64, 0, SLAB_NO_MERGE, NULL);
 	b_cache = kmem_cache_create("lkdtm-heap-b", 64, 0, SLAB_NO_MERGE, NULL);
 }
@@ -366,6 +433,7 @@ void __init lkdtm_heap_init(void)
 void __exit lkdtm_heap_exit(void)
 {
 	kmem_cache_destroy(double_free_cache);
+	kmem_cache_destroy(double_free_ctor_cache);
 	kmem_cache_destroy(a_cache);
 	kmem_cache_destroy(b_cache);
 }
@@ -381,6 +449,7 @@ static struct crashtype crashtypes[] = {
 	CRASHTYPE(SLAB_INIT_ON_ALLOC),
 	CRASHTYPE(BUDDY_INIT_ON_ALLOC),
 	CRASHTYPE(SLAB_FREE_DOUBLE),
+	CRASHTYPE(SLAB_FREE_DOUBLE_CTOR),
 	CRASHTYPE(SLAB_FREE_CROSS),
 	CRASHTYPE(SLAB_FREE_PAGE),
 };

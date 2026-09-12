@@ -31,6 +31,7 @@ READ_BUDDY_AFTER_FREE call trace:|Memory correctly poisoned
 SLAB_INIT_ON_ALLOC Memory appears initialized
 BUDDY_INIT_ON_ALLOC Memory appears initialized
 SLAB_FREE_DOUBLE
+SLAB_FREE_DOUBLE_CTOR SLUB: double free of object .* in cache 'lkdtm-heap-double_free_ctor'
 SLAB_FREE_CROSS
 SLAB_FREE_PAGE
 #SOFTLOCKUP Hangs the system
