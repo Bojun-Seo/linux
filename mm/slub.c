@@ -2068,6 +2068,7 @@ static inline void inc_slabs_node(struct kmem_cache *s, int node,
 							int objects) {}
 static inline void dec_slabs_node(struct kmem_cache *s, int node,
 							int objects) {}
+static inline bool slab_add_kunit_errors(void) { return false; }
 #endif /* CONFIG_SLUB_DEBUG */
 
 /*
