@@ -1,0 +1,136 @@
+[PATCH 0/3] mm/slub: lightweight double-free detection for sheaf-cached objects
+===============================================================================
+
+Objects freed into SLUB percpu sheaves are kept as pointers in an array
+and skip set_freepointer(), where SLAB_FREELIST_HARDENED's naive
+double-free check lives, so a double free into a sheaf goes unnoticed.
+This series adds CONFIG_SLUB_DOUBLEFREE_CHECK, an opt-in, best-effort
+O(1) check for such objects, meant to be cheap enough for production
+kernels.  It is not a replacement for KASAN or slub_debug.
+
+On an eligible cache, freeing an object writes a sentinel into its
+freepointer slot, which sheaves leave untouched.  A later free that still
+finds the sentinel is reported and dropped before the memcg, allocation
+profiling and other free hooks run, so the object is not inserted into
+the allocator a second time.  Allocation clears the sentinel.
+
+The check and the store are not atomic, so two racing frees can both
+pass.  Reallocation, or draining the object to the slab freelist, ends
+the detection window.
+
+What it costs
+
+  No per-object or per-slab storage is added: the sentinel reuses the
+  freepointer slot that eligible caches already keep outside the object.
+  Eligibility is decided once in calculate_sizes() and kept as an
+  internal cache flag, so ineligible caches only test that bit.  For an
+  eligible object the slot is read and written on free and written on
+  allocation.
+
+  x86_64 defconfig, gcc 13.3, bloat-o-meter on mm/slub.o with the option
+  enabled (top five of 25 changed symbols):
+
+    kvfree_rcu_cb                   881    1024    +143
+    kmem_cache_free_bulk           2123    2258    +135
+    kmem_cache_free                 712     828    +116
+    __rcu_free_sheaf_prepare        460     569    +109
+    kfree                           711     813    +102
+    Total: Before=66376, After=67599, chg +1.84%
+
+  This is code size only.  I have not run alloc/free or filesystem
+  benchmarks yet and would welcome numbers from anyone who can.
+
+What it covers
+
+  A cache qualifies if it uses percpu sheaves, keeps the freepointer
+  outside the object body and is not SLAB_TYPESAFE_BY_RCU.  In practice
+  that means constructor caches without a custom freepointer offset, for
+  example:
+
+    inode_cache, proc_inode_cache, shmem_inode_cache, bdev_cache,
+    aio_inode_cache, radix_tree_node
+
+  and most filesystem inode caches.  sighand_cache and anon_vma are left
+  out because they are SLAB_TYPESAFE_BY_RCU.
+
+  Single frees, kmem_cache_free_bulk() with a cache, and RCU sheaf
+  processing are checked.  A sentinel also survives while its sheaf sits
+  in a barn or with a prefill caller.  Not covered:
+
+    - kmalloc() caches, caches with slub_debug checks (SLAB_DEBUG_FLAGS
+      remove the sheaves) and SLAB_TYPESAFE_BY_RCU caches;
+    - KFENCE objects, whose slot must not be touched;
+    - a first free that fell through to __slab_free();
+    - kfree_bulk() and kmem_cache_free_bulk(NULL, ...), which overwrite
+      the sentinel while building the detached freelist;
+    - kfree_nolock(), which does not go through slab_free_hook();
+    - racing frees, and stale frees after reallocation.
+
+  KASAN builds are excluded in Kconfig, as KASAN already reports double
+  frees with the allocation and free stacks.  This check only reports the
+  stack of the duplicate free, the cache name and the object; for an RCU
+  sheaf that stack is the RCU callback's.  Reports taint the kernel and
+  go through CHECK_DATA_CORRUPTION(): a rate-limited WARN() by default,
+  fatal with panic_on_warn, or a BUG() with CONFIG_BUG_ON_DATA_CORRUPTION.
+
+Why a build option rather than a slub_debug flag
+
+  The flags in SLAB_DEBUG_FLAGS remove a cache's sheaves, which the
+  sentinel depends on, so the check cannot be one of those slub_debug
+  options.  A Kconfig option lets it compile out entirely.  A boot-time
+  switch that keeps the sheaves would also work: the per-cache flag is
+  already the only thing the hot paths test, so it would be a small
+  change on top if reviewers prefer it.
+
+Related work
+
+  Pengpeng Hou has proposed keeping the previous allocation and free of
+  each object under slub_debug=U:
+
+    https://lore.kernel.org/linux-mm/20260813160825.73031-1-pengpeng@iscas.ac.cn/
+
+  That applies to SLAB_STORE_USER caches, which have no sheaves and so are
+  never armed by this check.  Neither series depends on the other.
+
+Testing
+
+  slub_kunit gains four tests: a double free is reported and dropped, an
+  object handed out again is not reported, a pointer repeated in one bulk
+  free is caught, and a debug cache never arms the sentinel.  They pass
+  under UML, also with MEM_ALLOC_PROFILING_DEBUG enabled.  With the check
+  moved after the accounting hooks, that configuration warns "alloc_tag
+  was not set" on the second free, and dropping the sentinel clear on
+  allocation makes the reuse test fail.
+
+  Under UML, a double free triggered outside KUnit gives a WARN() by
+  default, a panic with panic_on_warn=1 and a BUG() with
+  CONFIG_BUG_ON_DATA_CORRUPTION=y.
+
+  lkdtm gains SLAB_FREE_DOUBLE_CTOR, SLAB_FREE_DOUBLE on a constructor
+  cache that ignores slub_debug=.  Without the option, or without a
+  suitable local object, it reports XFAIL instead of freeing twice.  It
+  has been build-tested only so far.
+
+  Each patch builds without warnings at W=1 on x86_64, with both
+  CONFIG_SLUB_DEBUG=y and =n.
+
+Possible follow-up
+
+  The report only has the stack of the duplicate free.  Recording the
+  first free's stack would need a stack depot handle per object.  A
+  tagged handle could fit in the pointer-sized slot, but the depot still
+  costs memory and a stack walk per free, so it would have to sit behind
+  a boot parameter.  Not implemented here.
+
+Bojun Seo (3):
+  mm/slub: detect double frees of sheaf-cached objects
+  slub_kunit: add tests for double-free detection
+  lkdtm: add SLAB_FREE_DOUBLE_CTOR heap test
+
+ drivers/misc/lkdtm/heap.c               |  69 ++++++++
+ include/linux/slab.h                    |   3 +
+ lib/tests/slub_kunit.c                  | 189 ++++++++++++++++++++
+ mm/Kconfig                              |  20 +++
+ mm/slub.c                               | 222 ++++++++++++++++++++++--
+ tools/testing/selftests/lkdtm/tests.txt |   1 +
+ 6 files changed, 492 insertions(+), 12 deletions(-)
